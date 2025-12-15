@@ -13,6 +13,9 @@ from PIL import Image
 import folder_paths
 from comfy.utils import ProgressBar
 
+# Global client instance for reuse
+_configured_client = None
+
 
 def read_config() -> Dict[str, Any]:
     """Read configuration from lmstudio_config.json."""
@@ -37,18 +40,92 @@ def read_tasks() -> Dict[str, str]:
     return tasks
 
 
+def get_configured_client():
+    """Get a configured LMStudio client with proper host settings."""
+    global _configured_client
+    
+    # Return cached client if available
+    if _configured_client is not None:
+        return _configured_client
+    
+    import lmstudio as lms
+    
+    cfg = read_config()
+    lmstudio_host = cfg.get("lmstudio_host", "localhost")
+    lmstudio_port = cfg.get("lmstudio_port", 1234)
+    
+    try:
+        # Create client with custom api_host
+        api_host = f"{lmstudio_host}:{lmstudio_port}"
+        client = lms.Client(api_host=api_host)
+        _configured_client = client
+        print(f"LMStudio client configured for {api_host}")
+        return client
+    except Exception as e:
+        print(f"Failed to configure LMStudio client for {lmstudio_host}:{lmstudio_port}: {e}")
+
+
+def get_llm_by_id(client, model_id=None):
+    """Get an LLM instance by ID, or return the first loaded model if no ID specified."""
+    try:
+        # Get loaded models first
+        loaded_models = client.list_loaded_models()
+        
+        if model_id:
+            # First try exact match
+            for model in loaded_models:
+                if hasattr(model, 'identifier') and model.identifier == model_id:
+                    return model
+            
+            # Try partial matching if exact match fails
+            for model in loaded_models:
+                if hasattr(model, 'identifier') and model_id.lower() in model.identifier.lower():
+                    print(f"Using partial match: {model.identifier} for requested {model_id}")
+                    return model
+            
+            # If still no match, use first available model as fallback
+            if loaded_models:
+                fallback_model = loaded_models[0]
+                print(f"Model {model_id} not found. Using fallback: {fallback_model.identifier}")
+                print(f"Available models: {[m.identifier for m in loaded_models]}")
+                return fallback_model
+            else:
+                print(f"Model {model_id} not found and no models are loaded")
+                return None
+        else:
+            # Return first loaded model if available
+            if loaded_models:
+                return loaded_models[0]
+            else:
+                print("No models currently loaded")
+                return None
+                
+    except Exception as e:
+        print(f"Error getting LLM: {e}")
+        return None
+        # Fallback to default client
+        _configured_client = lms.Client()
+        return _configured_client
+
 def fetch_models() -> Optional[List[str]]:
     import lmstudio as lms
     """Fetch available models from LM Studio using the official SDK."""
     try:
-        downloaded = lms.list_downloaded_models()
+        # Configure client with remote host
+        client = get_configured_client()
+        
+        # Use client methods directly instead of global functions
+        downloaded = client.list_downloaded_models()
         keys: List[str] = []
         for m in downloaded:
             key = getattr(m, "model_key", None) or getattr(m, "key", None)
             keys.append(key if isinstance(key, str) else str(m))
         return keys or None
     except Exception as e:
-        print(f"Error fetching models: {e}")
+        cfg = read_config()
+        lmstudio_host = cfg.get("lmstudio_host", "localhost")
+        lmstudio_port = cfg.get("lmstudio_port", 1234)
+        print(f"Error fetching models from {lmstudio_host}:{lmstudio_port}: {e}")
         return None
 
 
@@ -172,7 +249,7 @@ def truncate_conversation_to_fit(model_handle: Any, messages: List[Dict[str, Any
     Returns:
         Truncated list of messages that fits in context
     """
-    if not messages:
+    if not messages or model_handle is None:
         return messages
     
     try:
@@ -430,6 +507,9 @@ class WASLMStudioModel:
         import lmstudio as lms
 
         cfg = read_config()
+        
+        # Configure client with remote host
+        client = get_configured_client()
 
         chosen_id = manual_model_id.strip() if manual_model_id.strip() else model
         if chosen_id == "<no models found>":
@@ -438,7 +518,11 @@ class WASLMStudioModel:
         selected_max = int(image_max_size) if str(image_max_size).isdigit() else int(cfg.get("default_image_max_size", 1024))
 
         try:
-            _handle = lms.llm(chosen_id)
+            # Configure client with remote host
+            client = get_configured_client()
+            
+            # Get LLM instance 
+            _llm_instance = get_llm_by_id(client, chosen_id)
             print(f"Loaded (or attached to) model: {chosen_id}")
         except Exception as e:
             print(f"Warning: Could not load model {chosen_id}: {e}")
@@ -534,8 +618,19 @@ class WASLMStudioQuery:
         responses_out: List[str] = ["Error: Failed to process request"]
         tmp_img_paths: List[str] = []
         try:
+            # Configure client with remote host
+            client = get_configured_client()
+            
             imgs = listify(images)
-            model_handle = lms.llm(model_id) if model_id else lms.llm()
+            model_handle = get_llm_by_id(client, model_id)
+
+            if model_handle is None:
+                raise Exception(f"Could not load model {model_id}. Available models: {[m.identifier for m in client.list_loaded_models()]}")
+
+            
+            if model_handle is None:
+                raise Exception(f"Could not load model {model_id}. Available models: {[m.identifier for m in client.list_loaded_models()]}")
+            
             if imgs:
                 if mode == "one-by-one":
                     out: List[str] = []
@@ -543,7 +638,7 @@ class WASLMStudioQuery:
                     for idx, img in enumerate(imgs):
                         path = image_tensor_to_temp_png_path(img, max_edge=max_edge)
                         tmp_img_paths.append(path)
-                        img_handle = lms.prepare_image(path)
+                        img_handle = client.prepare_image(path)
                         chat = lms.Chat(system_prompt) if system_prompt else lms.Chat()
                         chat.add_user_message(user_prompt or "", images=[img_handle])
                         params: Dict[str, Any] = {
@@ -567,7 +662,7 @@ class WASLMStudioQuery:
                     for i in imgs:
                         path = image_tensor_to_temp_png_path(i, max_edge=max_edge)
                         tmp_img_paths.append(path)
-                        img_handles.append(lms.prepare_image(path))
+                        img_handles.append(client.prepare_image(path))
                     chat = lms.Chat(system_prompt) if system_prompt else lms.Chat()
                     chat.add_user_message(user_prompt or "", images=img_handles)
                     params: Dict[str, Any] = {
@@ -886,8 +981,18 @@ class WASLMStudioChat:
         tmp_img_paths: List[str] = []
         model_handle = None
         try:
+            # Get configured client
+            client = get_configured_client()
+            
             imgs = listify(images)
-            model_handle = lms.llm(model_id) if model_id else lms.llm()
+            model_handle = get_llm_by_id(client, model_id)
+
+            if model_handle is None:
+                raise Exception(f"Could not load model {model_id}. Available models: {[m.identifier for m in client.list_loaded_models()]}")
+
+            
+            if model_handle is None:
+                raise Exception(f"Could not load model {model_id}. Available models: {[m.identifier for m in client.list_loaded_models()]}")
             
             # Truncate conversation history if it exceeds context length
             # Reserve tokens for max_tokens response
@@ -899,7 +1004,7 @@ class WASLMStudioChat:
                     for idx, img in enumerate(imgs):
                         path = image_tensor_to_temp_png_path(img, max_edge=max_edge)
                         tmp_img_paths.append(path)
-                        img_handle = lms.prepare_image(path)
+                        img_handle = client.prepare_image(path)
                         chat = lms.Chat.from_history({"messages": msgs}) if msgs else (lms.Chat(system_prompt) if system_prompt else lms.Chat())
                         chat.add_user_message(user_prompt or "", images=[img_handle])
                         params: Dict[str, Any] = {
@@ -925,7 +1030,7 @@ class WASLMStudioChat:
                     for i in imgs:
                         path = image_tensor_to_temp_png_path(i, max_edge=max_edge)
                         tmp_img_paths.append(path)
-                        img_handles.append(lms.prepare_image(path))
+                        img_handles.append(client.prepare_image(path))
                     chat = lms.Chat.from_history({"messages": msgs}) if msgs else (lms.Chat(system_prompt) if system_prompt else lms.Chat())
                     chat.add_user_message(user_prompt or "", images=img_handles)
                     params: Dict[str, Any] = {
@@ -1093,7 +1198,16 @@ class WASLMStudioCaption:
         result = string_list(["Error: Failed to process request"])
         
         try:
-            model_handle = lms.llm(model_id) if model_id else lms.llm()
+            # Get configured client
+            client = get_configured_client()
+            model_handle = get_llm_by_id(client, model_id)
+
+            if model_handle is None:
+                raise Exception(f"Could not load model {model_id}. Available models: {[m.identifier for m in client.list_loaded_models()]}")
+
+            
+            if model_handle is None:
+                raise Exception(f"Could not load model {model_id}. Available models: {[m.identifier for m in client.list_loaded_models()]}")
             if mode == "one-by-one":
                 out: List[str] = []
                 tmp_img_paths: List[str] = []
@@ -1101,7 +1215,7 @@ class WASLMStudioCaption:
                 for idx, img in enumerate(imgs):
                     path = image_tensor_to_temp_png_path(img, max_edge=max_edge)
                     tmp_img_paths.append(path)
-                    img_handle = lms.prepare_image(path)
+                    img_handle = client.prepare_image(path)
                     chat = lms.Chat(system_text) if system_text else lms.Chat()
                     chat.add_user_message(user_prompt or "", images=[img_handle])
                     params: Dict[str, Any] = {
@@ -1126,7 +1240,7 @@ class WASLMStudioCaption:
                 for i in imgs:
                     path = image_tensor_to_temp_png_path(i, max_edge=max_edge)
                     tmp_img_paths.append(path)
-                    img_handles.append(lms.prepare_image(path))
+                    img_handles.append(client.prepare_image(path))
                 chat = lms.Chat(system_text) if system_text else lms.Chat()
                 chat.add_user_message(user_prompt or "", images=img_handles)
                 params: Dict[str, Any] = {
@@ -1345,6 +1459,9 @@ class WASLMStudioCaptionDataset:
     def caption_dataset(self, model: Dict[str, Any], dataset: Dict[str, Any], task_name: str, user_prompt: str, trigger_word_or_phrase: str, trigger_concat_mode: str, caption_behavior: str, options: Optional[Dict[str, Any]] = None):
         import lmstudio as lms
         
+        # Configure client with remote host
+        client = get_configured_client()
+        
         model_id = model.get("model_id", "")
         temperature = float(model.get("temperature", 0.2))
         max_tokens = int(model.get("max_tokens", 512))
@@ -1389,7 +1506,13 @@ class WASLMStudioCaptionDataset:
         skipped_count = 0
         model_handle = None
         try:
-            model_handle = lms.llm(model_id) if model_id else lms.llm()
+            # Get configured client
+            client = get_configured_client()
+            model_handle = get_llm_by_id(client, model_id)
+
+            if model_handle is None:
+                raise Exception(f"Could not load model {model_id}. Available models: {[m.identifier for m in client.list_loaded_models()]}")
+
             image_paths = [k for k in dataset.keys() if not str(k).startswith("__")]
             pbar = ProgressBar(len(image_paths))
             for idx, p in enumerate(image_paths):
@@ -1398,7 +1521,7 @@ class WASLMStudioCaptionDataset:
                         skipped_count += 1
                         pbar.update_absolute(idx + 1)
                         continue
-                    img_handle = lms.prepare_image(p)
+                    img_handle = client.prepare_image(p)
                     chat = lms.Chat(system_text) if system_text else lms.Chat()
                     chat.add_user_message(user_prompt or "", images=[img_handle])
                     params: Dict[str, Any] = {
@@ -1571,6 +1694,9 @@ class WASLMStudioCaptionDatasetCustom:
     def caption_dataset(self, model: Dict[str, Any], dataset: Dict[str, Any], system_prompt: str, user_prompt: str, trigger_word_or_phrase: str, trigger_concat_mode: str, caption_behavior: str, options: Optional[Dict[str, Any]] = None):
         import lmstudio as lms
         
+        # Configure client with remote host
+        client = get_configured_client()
+        
         model_id = model.get("model_id", "")
         temperature = float(model.get("temperature", 0.2))
         max_tokens = int(model.get("max_tokens", 512))
@@ -1615,7 +1741,13 @@ class WASLMStudioCaptionDatasetCustom:
         skipped_count = 0
         model_handle = None
         try:
-            model_handle = lms.llm(model_id) if model_id else lms.llm()
+            # Get configured client
+            client = get_configured_client()
+            model_handle = get_llm_by_id(client, model_id)
+
+            if model_handle is None:
+                raise Exception(f"Could not load model {model_id}. Available models: {[m.identifier for m in client.list_loaded_models()]}")
+
             image_paths = [k for k in dataset.keys() if not str(k).startswith("__")]
             pbar = ProgressBar(len(image_paths))
             for idx, p in enumerate(image_paths):
@@ -1624,7 +1756,7 @@ class WASLMStudioCaptionDatasetCustom:
                         skipped_count += 1
                         pbar.update_absolute(idx + 1)
                         continue
-                    img_handle = lms.prepare_image(p)
+                    img_handle = client.prepare_image(p)
                     chat = lms.Chat(system_text) if system_text else lms.Chat()
                     chat.add_user_message(user_prompt or "", images=[img_handle])
                     params: Dict[str, Any] = {
