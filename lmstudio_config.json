@@ -7,6 +7,6 @@
   "image_max_sizes": [256, 512, 1024, 2048],
   "default_image_max_size": 1024,
   "allowed_root_directories": ["/mnt/k", "/mnt/m"],
-  "lmstudio_host": "192.168.0.114",
+  "lmstudio_host": "172.21.219.13",
   "lmstudio_port": 1234
 }
