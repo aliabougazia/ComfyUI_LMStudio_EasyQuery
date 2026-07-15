@@ -99,6 +99,10 @@ def string_list(strings: List[str]) -> Tuple[List[str]]:
     return (strings,)
 
 
+# Keys that are handled in the node logic and must not be forwarded to the LM Studio SDK.
+_INTERNAL_OPTION_KEYS = {"strip_thinking_tags", "thinking_mode"}
+
+
 def strip_thinking_tags(text: str) -> str:
     """Remove <thinking>...</thinking> and <think>...</think> tags and their content from text."""
     import re
@@ -110,10 +114,25 @@ def strip_thinking_tags(text: str) -> str:
     return result.strip()
 
 
+def apply_thinking_mode(user_prompt: str, thinking_mode: str) -> str:
+    """Prepend /think or /nothink to the user prompt based on thinking_mode.
+
+    Supported thinking_mode values:
+      'think'    – prefix the message with /think to enable chain-of-thought reasoning.
+      'no_think' – prefix the message with /nothink to suppress chain-of-thought reasoning.
+      'auto'     – leave the message unchanged and let the model decide.
+    """
+    if thinking_mode == "think":
+        return f"/think\n{user_prompt}" if user_prompt else "/think"
+    if thinking_mode == "no_think":
+        return f"/nothink\n{user_prompt}" if user_prompt else "/nothink"
+    return user_prompt  # 'auto' – no modification
+
+
 def map_lms_params(params: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for k, v in params.items():
-        if v is None:
+        if v is None or k in _INTERNAL_OPTION_KEYS:
             continue
         if k == "max_tokens":
             out["maxTokens"] = v
@@ -530,7 +549,9 @@ class WASLMStudioQuery:
         unload = model.get("unload", False)
 
         model_handle = None
-        
+        thinking_mode = options.get("thinking_mode", "auto") if options else "auto"
+        effective_prompt = apply_thinking_mode(user_prompt or "", thinking_mode)
+
         responses_out: List[str] = ["Error: Failed to process request"]
         tmp_img_paths: List[str] = []
         try:
@@ -545,7 +566,7 @@ class WASLMStudioQuery:
                         tmp_img_paths.append(path)
                         img_handle = lms.prepare_image(path)
                         chat = lms.Chat(system_prompt) if system_prompt else lms.Chat()
-                        chat.add_user_message(user_prompt or "", images=[img_handle])
+                        chat.add_user_message(effective_prompt, images=[img_handle])
                         params: Dict[str, Any] = {
                             "temperature": temperature,
                             "max_tokens": max_tokens,
@@ -569,7 +590,7 @@ class WASLMStudioQuery:
                         tmp_img_paths.append(path)
                         img_handles.append(lms.prepare_image(path))
                     chat = lms.Chat(system_prompt) if system_prompt else lms.Chat()
-                    chat.add_user_message(user_prompt or "", images=img_handles)
+                    chat.add_user_message(effective_prompt, images=img_handles)
                     params: Dict[str, Any] = {
                         "temperature": temperature,
                         "max_tokens": max_tokens,
@@ -586,7 +607,7 @@ class WASLMStudioQuery:
                     responses_out = [str(pred)]
             else:
                 chat = lms.Chat(system_prompt) if system_prompt else lms.Chat()
-                chat.add_user_message(user_prompt or "")
+                chat.add_user_message(effective_prompt)
                 params: Dict[str, Any] = {
                     "temperature": temperature,
                     "max_tokens": max_tokens,
@@ -670,7 +691,19 @@ class WASLMStudioOptions:
                 ),
                 "strip_thinking_tags": (
                     "BOOLEAN",
-                    {"default": False, "tooltip": "Remove <thinking>...</thinking> tags and their content from the output. Useful for getting clean captions without reasoning text."},
+                    {"default": False, "tooltip": "Remove <thinking>...</thinking> / <think>...</think> tags and their content from the output. Useful for getting clean captions without reasoning text."},
+                ),
+                "thinking_mode": (
+                    ["auto", "think", "no_think"],
+                    {
+                        "default": "auto",
+                        "tooltip": (
+                            "Control chain-of-thought reasoning for models that support it (e.g. Qwen3). "
+                            "'auto' lets the model decide; 'think' prefixes the message with /think to "
+                            "enable reasoning; 'no_think' prefixes with /nothink to disable reasoning. "
+                            "Has no effect on models that do not support think/nothink."
+                        ),
+                    },
                 ),
             },
             "optional": {
@@ -697,6 +730,7 @@ class WASLMStudioOptions:
         presence_penalty: float,
         repeat_penalty: float,
         strip_thinking_tags: bool,
+        thinking_mode: str = "auto",
         stop: str = "",
     ):
         params: Dict[str, Any] = {
@@ -709,6 +743,7 @@ class WASLMStudioOptions:
             "presence_penalty": float(presence_penalty),
             "repeat_penalty": float(repeat_penalty),
             "strip_thinking_tags": bool(strip_thinking_tags),
+            "thinking_mode": str(thinking_mode),
         }
         if stop.strip():
             params["stop"] = [s for s in stop.split(",") if s]
@@ -885,6 +920,8 @@ class WASLMStudioChat:
         responses_out: List[str] = ["Error: Failed to process request"]
         tmp_img_paths: List[str] = []
         model_handle = None
+        thinking_mode = options.get("thinking_mode", "auto") if options else "auto"
+        effective_prompt = apply_thinking_mode(user_prompt or "", thinking_mode)
         try:
             imgs = listify(images)
             model_handle = lms.llm(model_id) if model_id else lms.llm()
@@ -901,7 +938,7 @@ class WASLMStudioChat:
                         tmp_img_paths.append(path)
                         img_handle = lms.prepare_image(path)
                         chat = lms.Chat.from_history({"messages": msgs}) if msgs else (lms.Chat(system_prompt) if system_prompt else lms.Chat())
-                        chat.add_user_message(user_prompt or "", images=[img_handle])
+                        chat.add_user_message(effective_prompt, images=[img_handle])
                         params: Dict[str, Any] = {
                             "temperature": temperature,
                             "max_tokens": max_tokens,
@@ -927,7 +964,7 @@ class WASLMStudioChat:
                         tmp_img_paths.append(path)
                         img_handles.append(lms.prepare_image(path))
                     chat = lms.Chat.from_history({"messages": msgs}) if msgs else (lms.Chat(system_prompt) if system_prompt else lms.Chat())
-                    chat.add_user_message(user_prompt or "", images=img_handles)
+                    chat.add_user_message(effective_prompt, images=img_handles)
                     params: Dict[str, Any] = {
                         "temperature": temperature,
                         "max_tokens": max_tokens,
@@ -946,7 +983,7 @@ class WASLMStudioChat:
                     msgs.append({"role": "assistant", "content": str(pred)})
             else:
                 chat = lms.Chat.from_history({"messages": msgs}) if msgs else (lms.Chat(system_prompt) if system_prompt else lms.Chat())
-                chat.add_user_message(user_prompt or "")
+                chat.add_user_message(effective_prompt)
                 params: Dict[str, Any] = {
                     "temperature": temperature,
                     "max_tokens": max_tokens,
@@ -1088,6 +1125,8 @@ class WASLMStudioCaption:
 
         system_text = self.__class__.cached_tasks.get(task_name, task_name)
         imgs = listify(images)
+        thinking_mode = options.get("thinking_mode", "auto") if options else "auto"
+        effective_prompt = apply_thinking_mode(user_prompt or "", thinking_mode)
 
         model_handle = None
         result = string_list(["Error: Failed to process request"])
@@ -1103,7 +1142,7 @@ class WASLMStudioCaption:
                     tmp_img_paths.append(path)
                     img_handle = lms.prepare_image(path)
                     chat = lms.Chat(system_text) if system_text else lms.Chat()
-                    chat.add_user_message(user_prompt or "", images=[img_handle])
+                    chat.add_user_message(effective_prompt, images=[img_handle])
                     params: Dict[str, Any] = {
                         "temperature": temperature,
                         "max_tokens": max_tokens,
@@ -1128,7 +1167,7 @@ class WASLMStudioCaption:
                     tmp_img_paths.append(path)
                     img_handles.append(lms.prepare_image(path))
                 chat = lms.Chat(system_text) if system_text else lms.Chat()
-                chat.add_user_message(user_prompt or "", images=img_handles)
+                chat.add_user_message(effective_prompt, images=img_handles)
                 params: Dict[str, Any] = {
                     "temperature": temperature,
                     "max_tokens": max_tokens,
@@ -1388,6 +1427,8 @@ class WASLMStudioCaptionDataset:
         failed_count = 0
         skipped_count = 0
         model_handle = None
+        thinking_mode = options.get("thinking_mode", "auto") if options else "auto"
+        effective_prompt = apply_thinking_mode(user_prompt or "", thinking_mode)
         try:
             model_handle = lms.llm(model_id) if model_id else lms.llm()
             image_paths = [k for k in dataset.keys() if not str(k).startswith("__")]
@@ -1400,7 +1441,7 @@ class WASLMStudioCaptionDataset:
                         continue
                     img_handle = lms.prepare_image(p)
                     chat = lms.Chat(system_text) if system_text else lms.Chat()
-                    chat.add_user_message(user_prompt or "", images=[img_handle])
+                    chat.add_user_message(effective_prompt, images=[img_handle])
                     params: Dict[str, Any] = {
                         "temperature": temperature,
                         "max_tokens": max_tokens,
@@ -1614,6 +1655,8 @@ class WASLMStudioCaptionDatasetCustom:
         failed_count = 0
         skipped_count = 0
         model_handle = None
+        thinking_mode = options.get("thinking_mode", "auto") if options else "auto"
+        effective_prompt = apply_thinking_mode(user_prompt or "", thinking_mode)
         try:
             model_handle = lms.llm(model_id) if model_id else lms.llm()
             image_paths = [k for k in dataset.keys() if not str(k).startswith("__")]
@@ -1626,7 +1669,7 @@ class WASLMStudioCaptionDatasetCustom:
                         continue
                     img_handle = lms.prepare_image(p)
                     chat = lms.Chat(system_text) if system_text else lms.Chat()
-                    chat.add_user_message(user_prompt or "", images=[img_handle])
+                    chat.add_user_message(effective_prompt, images=[img_handle])
                     params: Dict[str, Any] = {
                         "temperature": temperature,
                         "max_tokens": max_tokens,
